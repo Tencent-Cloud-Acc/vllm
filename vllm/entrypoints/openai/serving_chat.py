@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import asyncio
 import json
 import time
@@ -51,7 +52,18 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
                                                 validate_request_params)
-from vllm.utils import as_list
+from vllm.utils import as_list, random_uuid
+
+# YoutuVL two-stage decoding imports
+try:
+    from vllm.model_executor.models.youtu_vl import (
+        YoutuVLLayoutParser, LayoutElement
+    )
+    HAS_YOUTUVL = True
+except ImportError:
+    HAS_YOUTUVL = False
+    YoutuVLLayoutParser = None
+    LayoutElement = None
 
 logger = init_logger(__name__)
 
@@ -177,6 +189,17 @@ class OpenAIServingChat(OpenAIServing):
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
+
+        # ========== YoutuVL Mode Detection ==========
+        youtuvl_mode = getattr(request, 'youtuvl_mode', None)
+        if youtuvl_mode and youtuvl_mode != "chat":
+            if not HAS_YOUTUVL:
+                return self.create_error_response(
+                    "YoutuVL two-stage decoding is not available. "
+                    "Please ensure youtu_vl model is properly installed."
+                )
+            return await self._handle_youtuvl_request(request, raw_request)
+        # ============================================
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -1595,3 +1618,764 @@ class OpenAIServingChat(OpenAIServing):
             engine_prompt["cache_salt"] = request.cache_salt
 
         return messages, [prompt_token_ids], [engine_prompt]
+
+    # ========== YoutuVL Two-Stage Decoding Methods ==========
+
+    # Debug flag for timing statistics
+    _YOUTUVL_DEBUG = os.environ.get("YOUTUVL_DEBUG", "0") == "1"
+
+    async def _handle_youtuvl_request(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Handle YoutuVL document parsing request."""
+        mode = getattr(request, 'youtuvl_mode', 'chat')
+
+        try:
+            if mode == "layout":
+                return await self._youtuvl_layout_detect(request, raw_request)
+            elif mode == "ocr":
+                return await self._youtuvl_ocr_recognize(request, raw_request)
+            elif mode == "document":
+                return await self._youtuvl_document_parse(request, raw_request)
+            else:
+                return self.create_error_response(f"Unknown youtuvl_mode: {mode}")
+        except Exception as e:
+            logger.exception(f"Error in YoutuVL {mode} mode")
+            return self.create_error_response(str(e))
+
+    async def _youtuvl_layout_detect(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Stage 1: Layout detection."""
+        # Build layout detection request
+        layout_request = self._build_youtuvl_layout_request(request)
+
+        # Call model for generation
+        response = await self._generate_youtuvl_response(layout_request, raw_request)
+        if isinstance(response, ErrorResponse):
+            return response
+
+        # Parse output
+        output_text = response.choices[0].message.content or ""
+        elements = YoutuVLLayoutParser.parse_layout_output(output_text)
+
+        # Filter by types
+        layout_types = getattr(request, 'layout_types', None)
+        if layout_types:
+            elements = YoutuVLLayoutParser.filter_by_types(elements, layout_types)
+
+
+        # Build response
+        return self._build_youtuvl_response(
+            request_id=response.id,
+            model=response.model,
+            mode="layout",
+            elements=elements,
+            usage=response.usage
+        )
+
+    async def _youtuvl_ocr_recognize(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Stage 2: OCR recognition (requires regions parameter)."""
+        regions = getattr(request, 'regions', None)
+        if not regions:
+            return self.create_error_response(
+                "OCR mode requires 'regions' parameter. "
+                "Example: [{'type': 'LAYOUT_TEXT', 'bbox': [x1, y1, x2, y2]}]"
+            )
+
+        # Build LayoutElement list from regions
+        elements = []
+        for r in regions:
+            bbox = r.get("bbox", [])
+            if isinstance(bbox, dict):
+                bbox = [bbox.get("x1", 0), bbox.get("y1", 0),
+                        bbox.get("x2", 0), bbox.get("y2", 0)]
+            elements.append(LayoutElement(
+                type=r.get("type", "LAYOUT_TEXT"),
+                bbox=tuple(bbox)
+            ))
+
+        # Batch OCR
+        # Sean 的 SDK 默认 batch_size=1（更稳定，避免 <sep> 丢失导致结果错位）。
+        batch_size = getattr(request, 'ocr_batch_size', 1) or 1
+        elements = await self._batch_ocr(request, elements, batch_size, raw_request)
+
+        return self._build_youtuvl_response(
+            request_id=f"chatcmpl-{random_uuid()}",
+            model=request.model or "youtu_vl",
+            mode="ocr",
+            elements=elements,
+            usage=None
+        )
+
+    async def _youtuvl_document_parse(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Full document parsing: Layout + OCR two-stage."""
+
+        # Check parsing mode
+        parse_mode = getattr(request, 'parse_mode', 'sequential')  # 'sequential', 'streaming', 'single_pass'
+        
+        # Legacy support for streaming_layout
+        streaming_layout = getattr(request, 'streaming_layout', False)
+        if streaming_layout and parse_mode == 'sequential':
+            parse_mode = 'streaming'
+        
+        if parse_mode == 'single_pass':
+            # 最优化模式：Layout + 全部 OCR 在一次多轮对话中完成
+            return await self._youtuvl_document_parse_single_pass(request, raw_request)
+        elif parse_mode == 'streaming':
+            return await self._youtuvl_document_parse_streaming(request, raw_request)
+        
+        # Default: sequential
+        return await self._youtuvl_document_parse_sequential(request, raw_request)
+
+    async def _youtuvl_document_parse_single_pass(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Single-pass optimization: Layout + All OCR with shared image encoding.
+        
+        Key insight: Use multi-turn conversation to keep image in context.
+        - Turn 1: Layout detection
+        - Turn 2: Batch OCR (all elements in one request)
+        
+        This avoids re-encoding the image for each OCR request.
+        Expected speedup: 2-3x for documents with many elements.
+        """
+
+        # Stage 1: Layout detection
+        layout_request = self._build_youtuvl_layout_request(request)
+            
+        layout_response = await self._generate_youtuvl_response(
+            layout_request, raw_request)
+            
+        if isinstance(layout_response, ErrorResponse):
+            return layout_response
+            
+        layout_output = layout_response.choices[0].message.content or ""
+        elements = YoutuVLLayoutParser.parse_layout_output(layout_output)
+        
+        # Filter and sort
+        layout_types = getattr(request, 'layout_types', None)
+        if layout_types:
+            elements = YoutuVLLayoutParser.filter_by_types(elements, layout_types)
+            
+        if not elements:
+            return self._build_youtuvl_response(
+                request_id=layout_response.id,
+                model=layout_response.model,
+                mode="document",
+                elements=[],
+                usage=layout_response.usage
+            )
+        
+        # Separate elements: OCR vs skip
+        skip_ocr_types = getattr(request, 'skip_ocr_types', None)
+        if skip_ocr_types is None:
+            SKIP_OCR_TYPES = {"LAYOUT_FIGURE", "LAYOUT_CHART", "LAYOUT_SEAL"}
+        else:
+            SKIP_OCR_TYPES = set(skip_ocr_types)
+            
+        ocr_elements = []
+        for elem in elements:
+            if elem.type in SKIP_OCR_TYPES:
+                elem.text = f"[{elem.type.replace('LAYOUT_', '')}]"
+            else:
+                ocr_elements.append(elem)
+        
+        if not ocr_elements:
+            return self._build_youtuvl_response(
+                request_id=layout_response.id,
+                model=layout_response.model,
+                mode="document",
+                elements=elements,
+                usage=layout_response.usage
+            )
+        
+        # Stage 2: Single OCR request with ALL elements using multi-turn
+        # This keeps the image in KV cache!
+        
+        # Build multi-turn conversation:
+        # User: <image> + layout_prompt
+        # Assistant: layout_output
+        # User: ocr_prompt (all elements)
+        ocr_responses = []
+        for elem in ocr_elements:
+            ocr_prompt = YoutuVLLayoutParser.format_ocr_prompt([elem])
+            
+            # Get original image content
+            original_user_content = []
+            for msg in request.messages:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "")
+                    content = msg.get("content", [])
+                else:
+                    role = getattr(msg, "role", "")
+                    content = getattr(msg, "content", [])
+                if role == "user":
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "image_url":
+                                original_user_content.append(item)
+                            elif hasattr(item, "type") and item.type == "image_url":
+                                original_user_content.append(item.model_dump() if hasattr(item, "model_dump") else item)
+                    break
+            
+            # Build multi-turn messages
+            multi_turn_messages = [
+                {
+                    "role": "user",
+                    "content": original_user_content + [{"type": "text", "text": ocr_prompt}]
+                }
+            ]
+            
+            ocr_request = ChatCompletionRequest(
+                model=request.model,
+                messages=multi_turn_messages,
+                max_tokens=min(getattr(request, 'max_tokens', None) or 4096, 4096),
+                temperature=0,
+                top_p=getattr(request, 'top_p', None) or 0.3,
+                repetition_penalty=getattr(request, 'repetition_penalty', None),
+                stop=getattr(request, 'stop', None),
+                stop_token_ids=getattr(request, 'stop_token_ids', None),
+                stream=False,
+                mm_processor_kwargs=getattr(request, 'mm_processor_kwargs', None),
+            )
+            
+            ocr_response = await self._generate_youtuvl_response(ocr_request, raw_request)
+            
+            if isinstance(ocr_response, ErrorResponse):
+                # Fallback: fill empty text
+                ocr_responses.append("")
+            else:
+                ocr_output = ocr_response.choices[0].message.content or ""
+                texts = YoutuVLLayoutParser.parse_ocr_output(ocr_output, len(ocr_elements))
+                ocr_responses.extend(texts)
+        for elem, text in zip(ocr_responses, texts):   
+            elem.text = text
+        
+        return self._build_youtuvl_response(
+            request_id=layout_response.id,
+            model=layout_response.model,
+            mode="document",
+            elements=elements,
+            usage=layout_response.usage
+        )
+
+    async def _youtuvl_document_parse_sequential(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Optimized sequential implementation: Layout + OCR in single/few requests.
+        
+        Key optimization: Use large OCR batch to minimize image re-encoding.
+        """
+
+        # Stage 1: Layout detection
+        layout_request = self._build_youtuvl_layout_request(request)
+        layout_response = await self._generate_youtuvl_response(layout_request, raw_request)
+        if isinstance(layout_response, ErrorResponse):
+            return layout_response
+
+        output_text = layout_response.choices[0].message.content or ""
+        elements = YoutuVLLayoutParser.parse_layout_output(output_text)
+
+        # Filter by types
+        layout_types = getattr(request, 'layout_types', None)
+        if layout_types:
+            elements = YoutuVLLayoutParser.filter_by_types(elements, layout_types)
+
+        if not elements:
+            return self._build_youtuvl_response(
+                request_id=layout_response.id,
+                model=layout_response.model,
+                mode="document",
+                elements=[],
+                usage=layout_response.usage
+            )
+
+        # Stage 2: Batch OCR
+        # 优化：使用更大的 batch_size 减少请求数，从而减少图像重编码次数
+        # 默认 batch_size=1 太保守，建议使用更大的值
+        batch_size = getattr(request, 'ocr_batch_size', 1) or 1
+
+        elements = await self._batch_ocr(request, elements, batch_size, raw_request)
+
+        return self._build_youtuvl_response(
+            request_id=layout_response.id,
+            model=layout_response.model,
+            mode="document",
+            elements=elements,
+            usage=layout_response.usage
+        )
+
+    async def _youtuvl_document_parse_streaming(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Streaming implementation: OCR starts as soon as layout elements are parsed.
+        
+        This overlaps Layout generation with OCR requests, reducing total latency.
+        """
+
+        # Build layout request with streaming enabled
+        layout_request = self._build_youtuvl_layout_request(request)
+        layout_request.stream = True
+        
+        # Clear youtuvl_mode to avoid recursion
+        if hasattr(layout_request, 'youtuvl_mode'):
+            object.__setattr__(layout_request, 'youtuvl_mode', None)
+
+        # Get skip_ocr_types config
+        skip_ocr_types = getattr(request, 'skip_ocr_types', None)
+        if skip_ocr_types is None:
+            SKIP_OCR_TYPES = {"LAYOUT_FIGURE", "LAYOUT_FOOTER_FIGURE", "LAYOUT_HEADER_FIGURE"}
+        else:
+            SKIP_OCR_TYPES = set(skip_ocr_types)
+
+        batch_size = getattr(request, 'ocr_batch_size', 1) or 1
+        layout_types = getattr(request, 'layout_types', None)
+        ocr_concurrency = getattr(request, 'ocr_concurrency', None)  # Limit concurrent OCR tasks
+        
+        # Accumulators
+        full_text = ""
+        parsed_elements: list = []
+        last_parsed_count = 0
+        
+        # OCR tasks management
+        ocr_tasks: list = []
+        ocr_element_indices: list = []  # Maps task index to element indices
+        pending_ocr_elements: list = []  # Elements waiting to form a batch
+        pending_ocr_indices: list = []   # Indices of pending elements
+        
+        # Semaphore for OCR concurrency control
+        ocr_semaphore = asyncio.Semaphore(ocr_concurrency) if ocr_concurrency else None
+        
+        request_id = f"chatcmpl-{random_uuid()}"
+        model_name = request.model or "youtu_vl"
+
+        async def submit_ocr_batch(elements_batch: list, indices: list):
+            """Submit a batch of elements for OCR."""
+            if not elements_batch:
+                return
+                        
+            ocr_prompt = YoutuVLLayoutParser.format_ocr_prompt(elements_batch)
+            ocr_request = self._build_youtuvl_ocr_request(request, ocr_prompt)
+            
+            async def run_ocr():
+                if ocr_semaphore:
+                    async with ocr_semaphore:
+                        return await self._generate_youtuvl_response(ocr_request, raw_request)
+                else:
+                    return await self._generate_youtuvl_response(ocr_request, raw_request)
+            
+            task = asyncio.create_task(run_ocr())
+            ocr_tasks.append(task)
+            ocr_element_indices.append((indices, elements_batch))
+
+        try:
+            # Stream layout generation
+            result = await self.create_chat_completion(layout_request, raw_request)
+            
+            if isinstance(result, ErrorResponse):
+                return result
+            
+            # Process streaming response
+            async for chunk_str in result:
+                if not chunk_str.startswith("data: "):
+                    continue
+                if chunk_str.strip() == "data: [DONE]":
+                    break
+                    
+                try:
+                    chunk_data = json.loads(chunk_str[6:])
+                    delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        full_text += content
+                        
+                        # Try to parse new elements incrementally
+                        new_elements = YoutuVLLayoutParser.parse_layout_output(full_text)
+                        
+                        # Check if we have new complete elements
+                        if len(new_elements) > last_parsed_count:
+                            for i in range(last_parsed_count, len(new_elements)):
+                                elem = new_elements[i]
+                                
+                                # Apply type filter
+                                if layout_types and elem.type not in layout_types:
+                                    continue
+                                
+                                parsed_elements.append(elem)
+                                elem_idx = len(parsed_elements) - 1
+                                
+                                # Check if this element needs OCR
+                                if elem.type in SKIP_OCR_TYPES:
+                                    elem.text = f"[{elem.type.replace('LAYOUT_', '')}]"
+                                else:
+                                    pending_ocr_elements.append(elem)
+                                    pending_ocr_indices.append(elem_idx)
+                                    
+                                    # Submit batch when full
+                                    if len(pending_ocr_elements) >= batch_size:
+                                        await submit_ocr_batch(
+                                            pending_ocr_elements[:], 
+                                            pending_ocr_indices[:]
+                                        )
+                                        pending_ocr_elements.clear()
+                                        pending_ocr_indices.clear()
+                            
+                            last_parsed_count = len(new_elements)
+                            
+                except json.JSONDecodeError:
+                    continue
+
+            # Submit any remaining elements
+            if pending_ocr_elements:
+                await submit_ocr_batch(pending_ocr_elements, pending_ocr_indices)
+
+            if not parsed_elements:
+                return self._build_youtuvl_response(
+                    request_id=request_id,
+                    model=model_name,
+                    mode="document",
+                    elements=[],
+                    usage=None
+                )
+                                
+            if ocr_tasks:
+                # Process results as they complete for better debugging
+                completed_count = 0
+                for coro in asyncio.as_completed(ocr_tasks):
+                    try:
+                        result = await coro
+                    except Exception as e:
+                        logger.warning(f"OCR task failed: {e}")
+                    completed_count += 1
+                
+                # Now process all results (tasks are already done)
+                for task_idx, task in enumerate(ocr_tasks):
+                    indices, batch_elements = ocr_element_indices[task_idx]
+                    
+                    try:
+                        result = task.result()
+                    except Exception as e:
+                        logger.warning(f"OCR task {task_idx} failed: {e}")
+                        for elem in batch_elements:
+                            elem.text = ""
+                        continue
+                    
+                    if isinstance(result, ErrorResponse):
+                        for elem in batch_elements:
+                            elem.text = ""
+                        continue
+                    
+                    output_text = result.choices[0].message.content or ""
+                    texts = YoutuVLLayoutParser.parse_ocr_output(output_text, len(batch_elements))
+                    
+                    for elem, text in zip(batch_elements, texts):
+                        elem.text = text
+
+            return self._build_youtuvl_response(
+                request_id=request_id,
+                model=model_name,
+                mode="document",
+                elements=parsed_elements,
+                usage=None
+            )
+            
+        except Exception as e:
+            logger.exception(f"Error in streaming layout parse: {e}")
+            return await self._youtuvl_document_parse_sequential(request, raw_request)
+
+    async def _batch_ocr(
+        self,
+        request: ChatCompletionRequest,
+        elements: list,
+        batch_size: int,
+        raw_request: Optional[Request] = None,
+    ) -> list:
+        """Batch OCR recognition with controlled parallel execution.
+        
+        OCR batches are submitted with controlled concurrency.
+        Use ocr_concurrency to balance between throughput and latency.
+        """
+        
+        # Get concurrency limit from request
+        ocr_concurrency = getattr(request, 'ocr_concurrency', None)
+        
+        # Types that don't need OCR (just description)
+        # Can be overridden by request.skip_ocr_types
+        skip_ocr_types = getattr(request, 'skip_ocr_types', None)
+        if skip_ocr_types is None:
+            # Default: skip FIGURE, CHART, SEAL
+            SKIP_OCR_TYPES = {"LAYOUT_FIGURE", "LAYOUT_CHART", "LAYOUT_SEAL"}
+        else:
+            SKIP_OCR_TYPES = set(skip_ocr_types)
+        
+        # Separate elements: ones that need OCR vs ones that don't
+        ocr_elements = []
+        skip_elements = []
+        for elem in elements:
+            if elem.type in SKIP_OCR_TYPES:
+                elem.text = f"[{elem.type.replace('LAYOUT_', '')}]"
+                skip_elements.append(elem)
+            else:
+                ocr_elements.append(elem)
+        
+        # If no elements need OCR, return early
+        if not ocr_elements:
+            return elements
+        
+        # Prepare all batches (only for elements that need OCR)
+        batches = []
+        for i in range(0, len(ocr_elements), batch_size):
+            batch = ocr_elements[i:i + batch_size]
+            batch_idx = i // batch_size
+            ocr_prompt = YoutuVLLayoutParser.format_ocr_prompt(batch)
+            ocr_request = self._build_youtuvl_ocr_request(request, ocr_prompt)
+            batches.append((batch_idx, batch, ocr_request))
+        
+        async def process_single_batch(batch_idx: int, batch: list, ocr_request):
+            """Process a single OCR batch."""
+            
+            # Call model
+            response = await self._generate_youtuvl_response(
+                ocr_request, raw_request)
+            
+            if isinstance(response, ErrorResponse):
+                # OCR failed, fill with empty text
+                for elem in batch:
+                    elem.text = ""
+                return None
+            
+            output_text = response.choices[0].message.content or ""
+            
+            # Parse output
+            texts = YoutuVLLayoutParser.parse_ocr_output(output_text, len(batch))
+            
+            # Fill text
+            for elem, text in zip(batch, texts):
+                elem.text = text
+
+            return None
+        
+        if ocr_concurrency is None or ocr_concurrency >= len(batches):
+            # Full parallel execution
+            tasks = [process_single_batch(idx, batch, req) for idx, batch, req in batches]
+        else:
+            # Controlled concurrency using semaphore
+            semaphore = asyncio.Semaphore(ocr_concurrency)
+            
+            async def limited_process(idx, batch, req):
+                async with semaphore:
+                    return await process_single_batch(idx, batch, req)
+            
+            tasks = [limited_process(idx, batch, req) for idx, batch, req in batches]
+        
+        # Wait for all OCR tasks to complete
+        await asyncio.gather(*tasks)
+        
+        return elements
+
+    def _build_youtuvl_layout_request(
+        self,
+        request: ChatCompletionRequest
+    ) -> ChatCompletionRequest:
+        """Build layout detection request."""
+        new_messages = []
+        for msg in request.messages:
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = msg.get("content", [])
+            else:
+                role = getattr(msg, "role", "")
+                content = getattr(msg, "content", [])
+
+            if role == "user":
+                new_content = []
+                # Keep image content
+                if isinstance(content, list):
+                    for item in content:
+                        # Handle both dict and pydantic model
+                        if isinstance(item, dict):
+                            if item.get("type") == "image_url":
+                                new_content.append(item)
+                        elif hasattr(item, "type"):
+                            # Pydantic model
+                            if item.type == "image_url":
+                                new_content.append(item.model_dump() if hasattr(item, "model_dump") else item)
+                elif isinstance(content, str):
+                    # content is just a string, no image
+                    logger.info(f"[YoutuVL] _build_youtuvl_layout_request: content is string, no image")
+
+                # Add layout prompt
+                new_content.append({
+                    "type": "text",
+                    "text": YoutuVLLayoutParser.LAYOUT_PROMPT
+                })
+                new_messages.append({"role": "user", "content": new_content})
+            else:
+                new_messages.append(
+                    msg if isinstance(msg, dict) else msg.model_dump())
+
+        # Create new request (reuse most parameters from original)
+        # NOTE: keep stop/penalties from the original request. Losing these can
+        # cause OCR/document decoding to "run away" and break <sep>-based parsing.
+        # Layout 输出通常只有 ~100-200 tokens，限制 max_tokens 减少不必要的计算
+        return ChatCompletionRequest(
+            model=request.model,
+            messages=new_messages,
+            max_tokens=512,  # Layout 输出通常 < 200 tokens
+            max_completion_tokens=getattr(request, 'max_completion_tokens', None),
+            temperature=0,  # Use greedy for layout detection
+            top_p=getattr(request, 'top_p', None) or 0.3,
+            repetition_penalty=getattr(request, 'repetition_penalty', None),
+            stop=getattr(request, 'stop', None),
+            stop_token_ids=getattr(request, 'stop_token_ids', None),
+            stream=False,
+            mm_processor_kwargs=getattr(request, 'mm_processor_kwargs', None),
+        )
+
+    def _build_youtuvl_ocr_request(
+        self,
+        request: ChatCompletionRequest,
+        ocr_prompt: str
+    ) -> ChatCompletionRequest:
+        """Build OCR request.
+        
+        Note: We do NOT include Layout prompt as prefix here because:
+        1. The model would continue generating Layout output instead of OCR
+        2. Prefix cache for multimodal models requires exact token match including image
+        3. Each OCR request has different bbox coordinates anyway
+        """
+        new_messages = []
+        for msg in request.messages:
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = msg.get("content", [])
+            else:
+                role = getattr(msg, "role", "")
+                content = getattr(msg, "content", [])
+
+            if role == "user":
+                new_content = []
+                # Keep image content
+                if isinstance(content, list):
+                    for item in content:
+                        # Handle both dict and pydantic model
+                        if isinstance(item, dict):
+                            if item.get("type") == "image_url":
+                                new_content.append(item)
+                        elif hasattr(item, "type"):
+                            if item.type == "image_url":
+                                new_content.append(item.model_dump() if hasattr(item, "model_dump") else item)
+
+                # Only OCR prompt, no Layout prefix
+                new_content.append({"type": "text", "text": ocr_prompt})
+                new_messages.append({"role": "user", "content": new_content})
+            else:
+                new_messages.append(
+                    msg if isinstance(msg, dict) else msg.model_dump())
+
+        # NOTE: keep stop/penalties from the original request.
+        # OCR 输出通常较短，限制 max_tokens 可以减少不必要的计算
+        # 单个 OCR 区域通常 < 500 tokens，batch_size=2 时 < 1000 tokens
+        ocr_max_tokens = min(getattr(request, 'max_tokens', None) or 4096, 2048)
+
+        return ChatCompletionRequest(
+            model=request.model,
+            messages=new_messages,
+            max_tokens=ocr_max_tokens,
+            max_completion_tokens=getattr(request, 'max_completion_tokens', None),
+            temperature=0,
+            top_p=getattr(request, 'top_p', None) or 0.3,
+            repetition_penalty=getattr(request, 'repetition_penalty', None),
+            stop=getattr(request, 'stop', None),
+            stop_token_ids=getattr(request, 'stop_token_ids', None),
+            stream=False,
+            mm_processor_kwargs=getattr(request, 'mm_processor_kwargs', None),
+        )
+
+    async def _generate_youtuvl_response(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Generate single response (non-streaming)."""
+        # Ensure stream=False
+        request.stream = False
+
+        # Clear youtuvl_mode to avoid recursion
+        if hasattr(request, 'youtuvl_mode'):
+            object.__setattr__(request, 'youtuvl_mode', None)
+
+        # Call original chat completion logic
+        result = await self.create_chat_completion(request, raw_request)
+
+        if isinstance(result, ErrorResponse):
+            return result
+
+        # If it's an AsyncGenerator, we need to collect the full response
+        if hasattr(result, '__aiter__'):
+            raise ValueError("Internal error: stream should be False for YoutuVL")
+
+        return result
+
+    def _build_youtuvl_response(
+        self,
+        request_id: str,
+        model: str,
+        mode: str,
+        elements: list,
+        usage: Optional[UsageInfo] = None
+    ) -> ChatCompletionResponse:
+        """Build YoutuVL response."""
+        result = {
+            "mode": mode,
+            "elements": [
+                {
+                    "index": i,
+                    **elem.to_dict()
+                }
+                for i, elem in enumerate(elements)
+            ]
+        }
+        
+        # Ensure usage is not None
+        if usage is None:
+            usage = UsageInfo(prompt_tokens=0, total_tokens=0, completion_tokens=0)
+
+        return ChatCompletionResponse(
+            id=request_id,
+            object="chat.completion",
+            created=int(time.time()),
+            model=model,
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=json.dumps(result, ensure_ascii=False),
+                    ),
+                    finish_reason="stop"
+                )
+            ],
+            usage=usage
+        )
+
+    # ========== End of YoutuVL Methods ==========
